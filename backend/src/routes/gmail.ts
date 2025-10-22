@@ -4,6 +4,8 @@ import { oauth2Client } from './auth';
 
 const router = express.Router();
 
+const AI_SERVICE_URL = process.env.AI_SERVICE_URL || 'http://localhost:8000';
+
 // Middleware to check authentication
 const requireAuth = (req: Request, res: Response, next: any) => {
   if (!req.session || !req.session.tokens) {
@@ -22,11 +24,10 @@ router.get('/messages', requireAuth, async (req: Request, res: Response) => {
     const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
     const maxResults = parseInt(req.query.maxResults as string) || 100;
 
-    // Get list of message IDs
     const listResponse = await gmail.users.messages.list({
       userId: 'me',
       maxResults: maxResults,
-      q: req.query.q as string || '' // Optional search query
+      q: req.query.q as string || ''
     });
 
     const messages = listResponse.data.messages || [];
@@ -35,7 +36,6 @@ router.get('/messages', requireAuth, async (req: Request, res: Response) => {
       return res.json({ emails: [], count: 0 });
     }
 
-    // Fetch full details for each message (in batches for efficiency)
     const emailPromises = messages.map(async (message) => {
       const msg = await gmail.users.messages.get({
         userId: 'me',
@@ -49,7 +49,6 @@ router.get('/messages', requireAuth, async (req: Request, res: Response) => {
       const subject = headers.find(h => h.name === 'Subject')?.value || 'No Subject';
       const date = headers.find(h => h.name === 'Date')?.value || '';
 
-      // Extract email address from "Name <email@domain.com>" format
       const emailMatch = from.match(/<(.+?)>/) || from.match(/([^\s]+@[^\s]+)/);
       const senderEmail = emailMatch ? emailMatch[1] : from;
 
@@ -59,6 +58,7 @@ router.get('/messages', requireAuth, async (req: Request, res: Response) => {
         senderFull: from,
         subject: subject,
         date: date,
+        snippet: msg.data.snippet || '',
         threadId: msg.data.threadId,
         labelIds: msg.data.labelIds || []
       };
@@ -85,7 +85,6 @@ router.get('/senders', requireAuth, async (req: Request, res: Response) => {
     const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
     const maxResults = parseInt(req.query.maxResults as string) || 500;
 
-    // Get list of message IDs
     const listResponse = await gmail.users.messages.list({
       userId: 'me',
       maxResults: maxResults
@@ -97,7 +96,6 @@ router.get('/senders', requireAuth, async (req: Request, res: Response) => {
       return res.json({ senders: [], count: 0 });
     }
 
-    // Fetch sender info for each message
     const senderMap = new Map<string, any>();
 
     const promises = messages.map(async (message) => {
@@ -114,7 +112,6 @@ router.get('/senders', requireAuth, async (req: Request, res: Response) => {
         const subject = headers.find(h => h.name === 'Subject')?.value || 'No Subject';
         const date = headers.find(h => h.name === 'Date')?.value || '';
 
-        // Extract email address
         const emailMatch = from.match(/<(.+?)>/) || from.match(/([^\s]+@[^\s]+)/);
         const senderEmail = emailMatch ? emailMatch[1] : from;
 
@@ -142,7 +139,6 @@ router.get('/senders', requireAuth, async (req: Request, res: Response) => {
 
     await Promise.all(promises);
 
-    // Convert map to array and sort by count
     const senders = Array.from(senderMap.values())
       .sort((a, b) => b.count - a.count);
 
@@ -153,6 +149,54 @@ router.get('/senders', requireAuth, async (req: Request, res: Response) => {
   } catch (error: any) {
     console.error('Error fetching senders:', error);
     res.status(500).json({ error: 'Failed to fetch senders', details: error.message });
+  }
+});
+
+/**
+ * POST /api/gmail/analyze-ai
+ * Analyze inbox using AI service
+ */
+router.post('/analyze-ai', requireAuth, async (req: Request, res: Response) => {
+  try {
+    const { emails, senders } = req.body;
+
+    if (!emails || emails.length === 0) {
+      return res.status(400).json({ error: 'No emails provided for analysis' });
+    }
+
+    const response = await fetch(`${AI_SERVICE_URL}/analyze`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ emails, senders })
+    });
+
+    if (!response.ok) {
+      throw new Error(`AI service returned ${response.status}`);
+    }
+
+    const analysis = await response.json();
+    
+    res.json(analysis);
+  } catch (error: any) {
+    console.error('AI analysis failed:', error);
+    
+    res.json({
+      summary: {
+        total_emails: req.body.emails?.length || 0,
+        unique_senders: req.body.senders?.length || 0,
+        category_breakdown: {},
+        ai_service_status: 'unavailable'
+      },
+      recommendations: [
+        '⚠️ AI service is currently unavailable',
+        'Using basic analysis instead',
+        'Start the AI service with: cd ai-service && python main.py'
+      ],
+      sender_insights: [],
+      patterns: {}
+    });
   }
 });
 
@@ -171,20 +215,17 @@ router.post('/delete', requireAuth, async (req: Request, res: Response) => {
     const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
     let deletedCount = 0;
 
-    // For each sender, find and delete their emails
     for (const sender of senders) {
-      // Search for emails from this sender
       const searchQuery = `from:${sender}`;
       const listResponse = await gmail.users.messages.list({
         userId: 'me',
         q: searchQuery,
-        maxResults: 500 // Gmail API limit
+        maxResults: 500
       });
 
       const messages = listResponse.data.messages || [];
 
       if (messages.length > 0) {
-        // Batch delete (Gmail API supports batchDelete)
         const messageIds = messages.map(m => m.id!);
         
         await gmail.users.messages.batchDelete({
@@ -209,14 +250,10 @@ router.post('/delete', requireAuth, async (req: Request, res: Response) => {
   }
 });
 
-/**
- * Helper function to categorize senders
- */
 function categorizeSender(email: string, subject: string): string {
   const lowerEmail = email.toLowerCase();
   const lowerSubject = subject.toLowerCase();
 
-  // Promotional
   if (
     lowerEmail.includes('newsletter') ||
     lowerEmail.includes('promo') ||
@@ -228,7 +265,6 @@ function categorizeSender(email: string, subject: string): string {
     return 'promotional';
   }
 
-  // Social
   if (
     lowerEmail.includes('facebook') ||
     lowerEmail.includes('twitter') ||
@@ -239,7 +275,6 @@ function categorizeSender(email: string, subject: string): string {
     return 'social';
   }
 
-  // Billing
   if (
     lowerEmail.includes('billing') ||
     lowerEmail.includes('invoice') ||
@@ -249,7 +284,6 @@ function categorizeSender(email: string, subject: string): string {
     return 'billing';
   }
 
-  // Security
   if (
     lowerSubject.includes('security') ||
     lowerSubject.includes('alert') ||
@@ -259,7 +293,6 @@ function categorizeSender(email: string, subject: string): string {
     return 'security';
   }
 
-  // Transactional
   if (
     lowerEmail.includes('no-reply') ||
     lowerEmail.includes('noreply') ||
@@ -269,7 +302,6 @@ function categorizeSender(email: string, subject: string): string {
     return 'transactional';
   }
 
-  // Default to work
   return 'work';
 }
 
